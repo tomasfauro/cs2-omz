@@ -33,6 +33,8 @@ moved the needle into a single, reversible, auditable app.
 - **Clear CS2 Shader Cache** — wipes CS2 + NVIDIA DX/GL caches for a clean rebuild. `Safe` `Low impact`
 - **Reduce Visual Effects** — Windows "Best performance" preset. `Safe` `Low impact`
 
+![Main Window](assets/screenshots/main.png)
+
 ### Network Optimizations
 - **Disable Nagle (Adapter)** — applied to the auto-detected active adapter. `Safe` `Medium impact`
 - **Optimize TCP Stack** — RSS on, DCA on, chimney offload off, ECN off, heuristics disabled. `Safe` `Medium impact`
@@ -46,6 +48,8 @@ moved the needle into a single, reversible, auditable app.
 > tweaks that are unsupported on that hardware (Nagle adapter, TCP stack) are automatically
 > skipped. Adapter power/interrupt properties that *do* work on Killer hardware are applied
 > normally.
+
+![Network Tab](assets/screenshots/network.png)
 
 ### CS2 UDP Optimizations
 - **Increase UDP Socket Buffers** — raises `SO_RCVBUF`/`SO_SNDBUF` for smoother packet flow. `Safe` `Medium impact`
@@ -78,6 +82,8 @@ Writes a `autoexec.cfg` tuned to your hardware directly to your CS2 `cfg/` folde
 - **HUD** — clean competitive HUD layout.
 - **Competitive** — radar scale, crosshair spread, buy binds.
 - **Audio** — low-latency audio settings.
+
+![Game Config Tab](assets/screenshots/launch.png)
 
 ## How to use
 
