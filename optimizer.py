@@ -418,13 +418,76 @@ def check_xbox_dvr_status() -> bool:
 
 _SERVICES = ["SysMain", "DiagTrack", "WSearch", "Spooler"]
 
+# Note: disabling "Spooler" stops all printing until re-enabled. The
+# original start type of every service is snapshotted to this JSON file
+# so ``restore_services()`` can put the system back exactly as it was —
+# ``restore_latest_backup()`` alone can't, because service config isn't
+# stored in the registry keys reg.exe exports.
+_SERVICES_SNAPSHOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "backups", "services_snapshot.json"
+)
+
+
+def _query_service_start_type(svc: str) -> str | None:
+    """Return START_TYPE token from ``sc qc`` ('2'=AUTO, '3'=DEMAND, '4'=DISABLED)."""
+    try:
+        r = subprocess.run(["sc", "qc", svc], capture_output=True, text=True,
+                           timeout=6, creationflags=_NO_WINDOW)
+        for line in r.stdout.splitlines():
+            ln = line.strip().upper()
+            if ln.startswith("START_TYPE"):
+                # e.g. "START_TYPE         : 2   AUTO_START"
+                parts = ln.split(":", 1)[1].strip().split()
+                if parts and parts[0].isdigit():
+                    return parts[0]
+    except Exception:
+        return None
+    return None
+
+
 def disable_unnecessary_services() -> Result:
+    import json
+    os.makedirs(os.path.dirname(_SERVICES_SNAPSHOT), exist_ok=True)
+    # Snapshot every service's current start type before changing anything.
+    snapshot: dict[str, str] = {}
+    for svc in _SERVICES:
+        st = _query_service_start_type(svc)
+        if st:
+            snapshot[svc] = st
+    if snapshot:
+        try:
+            with open(_SERVICES_SNAPSHOT, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2)
+        except Exception:
+            pass
+
     results = []
     for svc in _SERVICES:
         _run(["sc", "stop", svc])
         ok, _ = _run(["sc", "config", svc, "start=", "disabled"])
         results.append(f"{svc}:{'ok' if ok else 'fail'}")
-    return True, "Services: " + ", ".join(results)
+    return True, "Services: " + ", ".join(results) + "  (original state saved)"
+
+
+def restore_services() -> Result:
+    """Re-enable every service from the saved snapshot."""
+    import json
+    if not os.path.isfile(_SERVICES_SNAPSHOT):
+        return False, "No service snapshot found."
+    try:
+        with open(_SERVICES_SNAPSHOT, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except Exception as e:
+        return False, f"Snapshot read error: {e}"
+    _TYPE = {"2": "auto", "3": "demand", "4": "disabled"}
+    restored = []
+    for svc, st in snapshot.items():
+        token = _TYPE.get(st, "demand")
+        _run(["sc", "config", svc, "start=", token])
+        if token != "disabled":
+            _run(["sc", "start", svc])
+        restored.append(f"{svc}:{token}")
+    return True, "Services restored: " + ", ".join(restored)
 
 
 def check_services_status() -> bool:
@@ -559,7 +622,8 @@ OPTIMIZATIONS = [
      "Turn off Game Bar / DVR recording (7 registry keys).",
      disable_xbox_dvr, check_xbox_dvr_status),
     ("disable_unnecessary_services", "Disable Background Services",
-     "SysMain, DiagTrack, WSearch, PrintSpooler.",
+     "SysMain, DiagTrack, WSearch, PrintSpooler. ⚠ Disabling Spooler "
+     "stops printing until you click Revert Changes.",
      disable_unnecessary_services, check_services_status),
     ("optimize_ram_settings", "Optimize Memory Settings",
      "Tune Memory Management for gaming workloads.",

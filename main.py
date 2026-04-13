@@ -362,11 +362,20 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _revert_changes(self):
-        if not messagebox.askyesno("Revert", "Restore the most recent registry backup?"):
+        if not messagebox.askyesno(
+            "Revert",
+            "Restore the most recent registry backup AND re-enable any "
+            "services that were disabled?"):
             return
         ok, msg = restore_latest_backup()
         self._log(self.system_log, msg)
         self._log(self.network_log, msg)
+        # Services aren't in registry exports — re-enable from JSON snapshot.
+        try:
+            ok_svc, msg_svc = optimizer.restore_services()
+            self._log(self.system_log, msg_svc)
+        except Exception as e:
+            self._log(self.system_log, f"restore_services error: {e}")
         self.after(300, self._refresh_all_statuses)
 
     def _copy_launch(self):
