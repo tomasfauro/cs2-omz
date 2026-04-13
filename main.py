@@ -23,7 +23,7 @@ except ImportError:
 import hardware_detect
 import optimizer
 import network as netmod
-from backup import restore_latest_backup
+from backup import restore_session_backups, session_start
 
 VERSION = "1.0.0"
 
@@ -401,7 +401,7 @@ class App(ctk.CTk):
             "Restore the most recent registry backup AND re-enable any "
             "services that were disabled?"):
             return
-        ok, msg = restore_latest_backup()
+        ok, msg = restore_session_backups()
         self._log(self.system_log, msg)
         self._log(self.network_log, msg)
         # Services aren't in registry exports — re-enable from JSON snapshot.
@@ -435,6 +435,9 @@ def main():
             print("[CS2 OMZ] Administrator privileges are required.")
         sys.exit(1)
 
+    # Mark the start of a revertable session — "Revert Changes" restores
+    # every backup created after this point.
+    session_start()
     hw = hardware_detect.detect_all()
     app = App(hw)
     app.mainloop()

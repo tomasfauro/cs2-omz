@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import socket
 import subprocess
 import time
-from typing import Tuple
 
 try:
     import winreg
@@ -21,23 +19,21 @@ except ImportError:
     winreg = None
 
 from backup import backup_keys
+from utils import (
+    NO_WINDOW as _NO_WINDOW,
+    Result,
+    run_cmd as _run,
+    KILLER_NIC_KEYWORDS,
+    KILLER_SKIP_MESSAGE,
+)
 import hardware_detect
 
-Result = Tuple[bool, str]
 
-# Killer / Rivet Networks NICs (E2400, E2500, E3000, AX1650, ...) ship with
-# proprietary bandwidth-management drivers that break when the Windows TCP
-# stack is retuned via netsh or per-adapter registry tweaks — users have
-# lost connectivity entirely. Any op that touches the TCP stack must bail
-# out early when one of these adapters is active.
-KILLER_NIC_KEYWORDS = (
-    "killer", "rivet networks",
-    "killer e2400", "killer e2500", "killer e3000", "killer ax1650",
-)
-KILLER_SKIP_MESSAGE = (
-    "Killer NIC detected — TCP optimizations skipped to avoid "
-    "conflicts with Killer software"
-)
+def _ensure_backup(keys, tag) -> Result:
+    ok, _path, msg = backup_keys(keys, tag)
+    if not ok:
+        return False, f"Aborted — {msg}"
+    return True, msg
 
 
 def _is_killer_nic() -> bool:
@@ -50,9 +46,6 @@ def _is_killer_nic() -> bool:
     ])).lower()
     return any(k in haystack for k in KILLER_NIC_KEYWORDS)
 
-# Hide every spawned child window so the GUI never flashes a console.
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
 _TCPIP_INTERFACES = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
 _RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "backups", "ping_results.json")
@@ -61,17 +54,6 @@ _RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 def _active_adapter():
     info = hardware_detect.detect_all()
     return info.active_adapter_name, info.active_adapter_guid
-
-
-def _run(cmd: list[str], timeout: int = 20) -> Result:
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           creationflags=_NO_WINDOW)
-        if r.returncode == 0:
-            return True, (r.stdout.strip() or "ok")
-        return False, (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")
-    except Exception as e:
-        return False, str(e)
 
 
 # -------------------- Nagle (per-adapter) --------------------
@@ -83,7 +65,9 @@ def disable_nagle_algorithm() -> Result:
     if not guid or not winreg:
         return False, "Active adapter GUID not found."
     sub = f"{_TCPIP_INTERFACES}\\{guid}"
-    backup_keys([f"HKLM\\{sub}"], "nagle_adapter")
+    bok, bmsg = _ensure_backup([f"HKLM\\{sub}"], "nagle_adapter")
+    if not bok:
+        return False, bmsg
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub, 0,
                             winreg.KEY_SET_VALUE) as k:
@@ -112,16 +96,28 @@ def check_nagle_adapter_status() -> bool:
 def optimize_tcp_stack() -> Result:
     if _is_killer_nic():
         return False, KILLER_SKIP_MESSAGE
+    # (label, argv) pairs so failure messages identify which tweak failed.
     cmds = [
-        ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
-        ["netsh", "int", "tcp", "set", "global", "dca=enabled"],
-        ["netsh", "int", "tcp", "set", "global", "ecncapability=disabled"],
-        ["netsh", "int", "tcp", "set", "global", "timestamps=disabled"],
-        ["netsh", "int", "tcp", "set", "heuristics", "disabled"],
+        ("RSS on",         ["netsh", "int", "tcp", "set", "global", "rss=enabled"]),
+        ("DCA on",         ["netsh", "int", "tcp", "set", "global", "dca=enabled"]),
+        ("ECN off",        ["netsh", "int", "tcp", "set", "global", "ecncapability=disabled"]),
+        ("timestamps off", ["netsh", "int", "tcp", "set", "global", "timestamps=disabled"]),
+        ("heuristics off", ["netsh", "int", "tcp", "set", "heuristics", "disabled"]),
     ]
-    for c in cmds:
-        _run(c)
-    return True, "TCP stack tuned (RSS on, DCA on, ECN off, heuristics off)."
+    succeeded: list[str] = []
+    failures: list[str] = []
+    for label, argv in cmds:
+        ok, msg = _run(argv)
+        if ok:
+            succeeded.append(label)
+        else:
+            failures.append(f"{label}: {msg}")
+    if not failures:
+        return True, "TCP stack tuned (" + ", ".join(succeeded) + ")."
+    if not succeeded:
+        return False, "TCP stack: all commands failed (" + "; ".join(failures) + ")"
+    return False, (f"TCP stack: {len(succeeded)}/{len(cmds)} applied. "
+                   "Failed: " + "; ".join(failures))
 
 
 def _ps_query(script: str, timeout: int = 8) -> str:
@@ -190,7 +186,10 @@ def set_qos_cs2() -> Result:
         candidate = os.path.join(cs2, "game", "bin", "win64", "cs2.exe")
         if os.path.isfile(candidate):
             exe_path = candidate
-    backup_keys(["HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\QoS"], "qos")
+    bok, bmsg = _ensure_backup(
+        ["HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\QoS"], "qos")
+    if not bok:
+        return False, bmsg
     try:
         with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, _QOS_KEY) as k:
             winreg.SetValueEx(k, "Version", 0, winreg.REG_SZ, "1.0")

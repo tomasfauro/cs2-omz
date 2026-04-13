@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-from typing import Tuple
 
 try:
     import winreg
@@ -17,13 +16,17 @@ except ImportError:
     winreg = None
 
 from backup import backup_keys
+from utils import NO_WINDOW as _NO_WINDOW, Result, run_cmd as _run
 import hardware_detect
 
-Result = Tuple[bool, str]
 
-# Hide every child process window (PowerShell/CMD/netsh/etc.) so the GUI
-# doesn't flash black boxes while optimizations run.
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+def _ensure_backup(keys, tag) -> Result:
+    """Run ``backup_keys`` and translate its result into a caller-ready
+    ``(ok, message)``. When ``ok`` is False the caller must abort."""
+    ok, _path, msg = backup_keys(keys, tag)
+    if not ok:
+        return False, f"Aborted — {msg}"
+    return True, msg
 
 
 # -------------------- low-level registry helpers --------------------
@@ -45,24 +48,21 @@ def _reg_write_dword(root, sub, name, value) -> Result:
         return False, str(e)
 
 
-def _run(cmd: list[str], timeout: int = 20) -> Result:
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           creationflags=_NO_WINDOW)
-        if r.returncode == 0:
-            return True, (r.stdout.strip() or "ok")
-        return False, (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")
-    except Exception as e:
-        return False, str(e)
-
-
 # -------------------- HPET --------------------
 
 def disable_hpet() -> Result:
-    backup_keys(["HKLM\\SYSTEM\\CurrentControlSet\\Services\\hpet"], "hpet")
-    ok, msg = _run(["bcdedit", "/deletevalue", "useplatformclock"])
-    _run(["bcdedit", "/set", "disabledynamictick", "yes"])
-    return True, "HPET disabled (useplatformclock removed, dynamic tick off)." if ok else f"HPET: {msg}"
+    bok, bmsg = _ensure_backup(
+        ["HKLM\\SYSTEM\\CurrentControlSet\\Services\\hpet"], "hpet")
+    if not bok:
+        return False, bmsg
+    # bcdedit /deletevalue on a value that isn't set returns non-zero ("element
+    # not found"), which is harmless — the desired end state is the same.
+    del_ok, del_msg = _run(["bcdedit", "/deletevalue", "useplatformclock"])
+    tick_ok, tick_msg = _run(["bcdedit", "/set", "disabledynamictick", "yes"])
+    if tick_ok:
+        suffix = "" if del_ok else " (useplatformclock was already unset)"
+        return True, f"HPET disabled (dynamic tick off).{suffix}"
+    return False, f"HPET: disabledynamictick failed: {tick_msg}; delete: {del_msg}"
 
 
 def check_hpet_status() -> bool:
@@ -85,7 +85,9 @@ _CORE_PARK_KEY = (
 
 def disable_core_parking() -> Result:
     """Works for Intel and AMD — sets ValueMax=0 on the core-parking setting."""
-    backup_keys([_CORE_PARK_KEY], "core_parking")
+    bok, bmsg = _ensure_backup([_CORE_PARK_KEY], "core_parking")
+    if not bok:
+        return False, bmsg
     try:
         # Apply to current scheme
         _run(["powercfg", "-setacvalueindex", "scheme_current",
@@ -233,7 +235,9 @@ def enable_msi_mode_nvidia() -> Result:
     paths = _find_nvidia_gpu_device_keys()
     if not paths:
         return False, "NVIDIA GPU found but PCI Display device key is missing."
-    backup_keys([f"HKLM\\{p}" for p in paths], "nvidia_msi")
+    bok, bmsg = _ensure_backup([f"HKLM\\{p}" for p in paths], "nvidia_msi")
+    if not bok:
+        return False, bmsg
     ok_count = 0
     last_err = ""
     for p in paths:
@@ -268,7 +272,9 @@ def disable_nagle_algorithm() -> Result:
     """System-level Nagle disable (all interfaces)."""
     if not winreg:
         return False, "winreg unavailable."
-    backup_keys([f"HKLM\\{_NAGLE_BASE}"], "nagle_system")
+    bok, bmsg = _ensure_backup([f"HKLM\\{_NAGLE_BASE}"], "nagle_system")
+    if not bok:
+        return False, bmsg
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NAGLE_BASE) as root:
             i = 0
@@ -391,7 +397,9 @@ def disable_fullscreen_optimizations_cs2() -> Result:
     exe = _cs2_exe_path()
     if not exe:
         return False, "cs2.exe not found."
-    backup_keys([f"HKCU\\{_CS2_EXE_KEY}"], "cs2_fso")
+    bok, bmsg = _ensure_backup([f"HKCU\\{_CS2_EXE_KEY}"], "cs2_fso")
+    if not bok:
+        return False, bmsg
     try:
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _CS2_EXE_KEY) as k:
             winreg.SetValueEx(k, exe, 0, winreg.REG_SZ, _CS2_FLAG)
@@ -430,17 +438,29 @@ _DVR_KEYS = [
 def disable_xbox_dvr() -> Result:
     if not winreg:
         return False, "winreg unavailable."
-    backup_keys([
+    bok, bmsg = _ensure_backup([
         "HKCU\\System\\GameConfigStore",
         "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR",
         "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
         "HKCU\\SOFTWARE\\Microsoft\\GameBar",
     ], "xbox_dvr")
+    if not bok:
+        return False, bmsg
+    succeeded = 0
+    failures: list[str] = []
     for root, sub, name, val in _DVR_KEYS:
-        ok, _ = _reg_write_dword(root, sub, name, val)
-        if not ok:
-            continue
-    return True, "Xbox Game DVR / Game Bar disabled (7 keys)."
+        ok, msg = _reg_write_dword(root, sub, name, val)
+        if ok:
+            succeeded += 1
+        else:
+            failures.append(f"{sub}\\{name}: {msg}")
+    total = len(_DVR_KEYS)
+    if succeeded == total:
+        return True, f"Xbox Game DVR / Game Bar disabled ({succeeded}/{total} keys)."
+    if succeeded == 0:
+        return False, "Xbox DVR: all writes failed (" + "; ".join(failures) + ")"
+    return False, (f"Xbox DVR: only {succeeded}/{total} keys written. "
+                   "Failed: " + "; ".join(failures))
 
 
 def check_xbox_dvr_status() -> bool:
@@ -545,7 +565,9 @@ _MM_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
 def optimize_ram_settings() -> Result:
     if not winreg:
         return False, "winreg unavailable."
-    backup_keys([f"HKLM\\{_MM_KEY}"], "memory_mgmt")
+    bok, bmsg = _ensure_backup([f"HKLM\\{_MM_KEY}"], "memory_mgmt")
+    if not bok:
+        return False, bmsg
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MM_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
@@ -602,7 +624,9 @@ _VE_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
 def reduce_visual_effects() -> Result:
     if not winreg:
         return False, "winreg unavailable."
-    backup_keys([f"HKCU\\{_VE_KEY}"], "visual_effects")
+    bok, bmsg = _ensure_backup([f"HKCU\\{_VE_KEY}"], "visual_effects")
+    if not bok:
+        return False, bmsg
     ok, msg = _reg_write_dword(winreg.HKEY_CURRENT_USER, _VE_KEY,
                                "VisualFXSetting", 2)  # 2 = adjust for best performance
     return (True, "Visual effects set to 'Best performance'.") if ok else (False, msg)
