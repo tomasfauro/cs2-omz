@@ -643,8 +643,6 @@ def check_visual_effects_status() -> bool:
 def generate_launch_options() -> str:
     info = hardware_detect.detect_all()
     opts: list[str] = ["-mainthreadpriority 2", "+thread_pool_option 4"]
-    if info.monitor_width and info.monitor_height:
-        opts += [f"-w {info.monitor_width}", f"-h {info.monitor_height}"]
     if info.monitor_hz:
         opts.append(f"+fps_max {info.monitor_hz * 2}")
     opts.append("-allow_third_party_software")

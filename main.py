@@ -347,8 +347,7 @@ class App(ctk.CTk):
         explanations = {
             "-mainthreadpriority 2": "Raise CS2 main thread priority for smoother frametimes.",
             "+thread_pool_option 4": "Use the Source 2 worker thread pool tuned for gameplay.",
-            "-w / -h": "Match your monitor's native resolution.",
-            "+fps_max": "Cap FPS at 2x monitor refresh rate for stable frametimes.",
+"+fps_max": "Cap FPS at 2x monitor refresh rate for stable frametimes.",
             "-allow_third_party_software": "Allow tools like RivaTuner/MSI Afterburner overlay.",
         }
         box = ctk.CTkScrollableFrame(right)
