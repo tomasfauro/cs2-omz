@@ -50,6 +50,8 @@ class HardwareInfo:
 
     active_adapter_name: Optional[str] = None
     active_adapter_guid: Optional[str] = None
+    active_adapter_description: Optional[str] = None
+    is_killer_nic: bool = False
     current_dns: list = field(default_factory=list)
 
     has_ssd: bool = False
@@ -291,6 +293,8 @@ def _detect_steam(info: HardwareInfo) -> None:
 # so the model-name fallback has to be robust.
 _SSD_KEYWORDS = (
     "ssd", "nvme", "m.2",
+    "samsung", "samsung ssd", "samsung 850", "samsung 860", "samsung 870",
+    "850 evo", "860 evo", "870 evo", "850 pro", "860 pro", "870 pro",
     "evo", "qvo", "pro",          # Samsung
     "kingston", "a400", "kc", "sa400", "nv1", "nv2",  # Kingston
     "crucial", "mx500", "bx500", "p1", "p2", "p3", "p5",  # Crucial
@@ -303,21 +307,42 @@ _SSD_KEYWORDS = (
 )
 
 # Keywords that indicate a spinning disk even if "ssd" appears elsewhere.
+# WDC model codes like WD10EZRZ / WD20EZRZ / ST1000DM are spinning rust.
 _HDD_KEYWORDS = ("hdd", "hitachi", "wd blue wd", "barracuda", "deskstar",
-                 "caviar", "ironwolf ", "red wd", "skyhawk")
+                 "caviar", "ironwolf ", "red wd", "skyhawk",
+                 "wd", "wdc", "ezrz", "ezex", "efrx", "efax", "efzx",
+                 "seagate", "toshiba", "st1000", "st2000", "st3000", "st4000",
+                 "dt01", "mq01", "dm00")
+
+# Removable / USB flash media whose brand names overlap with SSD brands
+# (e.g. "Kingston DataTraveler"). Matched first so they can never be
+# misclassified as SSDs.
+_USB_KEYWORDS = ("datatraveler", "usb device", "usb flash", "flash drive",
+                 "thumb drive", "sandisk cruzer", "sandisk ultra usb",
+                 "jumpdrive", "mushkin usb")
 
 
 def _guess_from_model(model: str) -> str:
-    """Return 'ssd', 'hdd', or 'unknown' from a drive model string."""
+    """Return 'ssd', 'hdd', 'usb', or 'unknown' from a drive model string."""
     m = (model or "").lower().strip()
     if not m:
         return "unknown"
-    # SSD wins over HDD if both hit — "Samsung SSD 850 EVO" contains no HDD
-    # token, but mixed generic names like "WD Blue SSD" must classify as SSD.
+    # USB / flash removables first — their brand names often contain
+    # "Kingston"/"SanDisk" and would otherwise match SSD keywords.
+    if any(k in m for k in _USB_KEYWORDS):
+        return "usb"
+    # HDD check before SSD for models like "WDC WD10EZRZ" — the bare "wd"
+    # token would otherwise never fire because no SSD keyword matches it
+    # but we want spinning-disk detection to be explicit, not default.
+    if any(k in m for k in _HDD_KEYWORDS):
+        # But a WD SSD like "WD Blue SN550" should still win — those are
+        # covered by more specific SSD keywords ("wd blue sn", "wd_black").
+        if any(k in m for k in ("wd blue sn", "wd black sn", "wd green sn",
+                                "wd_black", "ssd", "nvme")):
+            return "ssd"
+        return "hdd"
     if any(k in m for k in _SSD_KEYWORDS):
         return "ssd"
-    if any(k in m for k in _HDD_KEYWORDS):
-        return "hdd"
     return "unknown"
 
 
@@ -329,10 +354,31 @@ def _detect_storage(info: HardwareInfo) -> None:
     SATA SSDs (e.g. Samsung 850 EVO) report MediaType=0 (Unspecified) and
     would otherwise go undetected.
     """
-    if not wmi:
-        return
-
     classified_any = False
+
+    # ---- Fallback when `wmi` module is unavailable: PowerShell ----
+    # Previously this function returned early when `import wmi` failed,
+    # which meant the keyword fallback never ran and systems like the
+    # Samsung 850 EVO silently reported has_ssd=False. Use Get-PhysicalDisk
+    # / Get-CimInstance to pull model strings regardless.
+    if not wmi:
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_DiskDrive | "
+                 "Select-Object -ExpandProperty Model"],
+                capture_output=True, text=True, timeout=8,
+                creationflags=_NO_WINDOW,
+            )
+            for line in (r.stdout or "").splitlines():
+                guess = _guess_from_model(line)
+                if guess == "ssd":
+                    info.has_ssd = True
+                elif guess == "hdd":
+                    info.has_hdd = True
+        except Exception:
+            pass
+        return
     # ---- Primary: MSFT_PhysicalDisk ----
     try:
         c = wmi.WMI(namespace=r"root\Microsoft\Windows\Storage")
@@ -363,35 +409,54 @@ def _detect_storage(info: HardwareInfo) -> None:
         c = wmi.WMI()
         for d in c.Win32_DiskDrive():
             model = d.Model or ""
-            # Skip USB sticks / removable media — their brand names overlap
-            # with SSD brands (e.g. "Kingston DataTraveler" USB flash).
             iface = (getattr(d, "InterfaceType", "") or "").lower()
             mtype = (getattr(d, "MediaType", "") or "").lower()
-            if iface == "usb" or "removable" in mtype or "datatraveler" in model.lower():
-                continue
             guess = _guess_from_model(model)
+            # Exclude USB / removable flash regardless of what interface
+            # WMI reports — some USB sticks enumerate as iface=SCSI.
+            if iface == "usb" or "removable" in mtype or guess == "usb":
+                continue
+            # Some SATA SSDs enumerate as iface=SCSI via LSI/SAS HBAs —
+            # trust the model-string guess regardless of interface type.
             if guess == "ssd":
                 info.has_ssd = True
             elif guess == "hdd":
                 info.has_hdd = True
-            elif not classified_any:
-                # Last resort: InterfaceType + MediaType string.
-                iface = (getattr(d, "InterfaceType", "") or "").lower()
-                mtype = (getattr(d, "MediaType", "") or "").lower()
-                if "fixed hard disk" in mtype or iface == "ide":
-                    # Still ambiguous — SATA drives can be SSD or HDD.
-                    # Heuristic: if model string has a digit pattern typical
-                    # of SSD capacities (120/240/250/480/500/1TB) alongside
-                    # "Samsung"/"Crucial"/"Kingston", call it SSD.
-                    lm = model.lower()
-                    if any(v in lm for v in ("samsung", "crucial", "kingston",
-                                             "sandisk", "intel", "adata",
-                                             "corsair")):
-                        info.has_ssd = True
-                    else:
-                        info.has_hdd = True
     except Exception:
         pass
+
+    # ---- Last-resort: PowerShell sweep ----
+    # The wmi Python module can raise on `wmi.WMI()` instantiation when the
+    # default namespace is in a partially-initialized state (observed on
+    # some 22H2 systems after a Windows Update). When that happens the
+    # whole `try` block above aborts before a single drive is seen and
+    # has_ssd silently stays False even though the user has a real SSD.
+    # Re-enumerate via PowerShell so classification *always* happens.
+    if not info.has_ssd and not info.has_hdd:
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_DiskDrive | "
+                 "ForEach-Object { \"$($_.Model)|$($_.InterfaceType)|$($_.MediaType)\" }"],
+                capture_output=True, text=True, timeout=8,
+                creationflags=_NO_WINDOW,
+            )
+            for raw in (r.stdout or "").splitlines():
+                parts = raw.strip().split("|")
+                if not parts or not parts[0]:
+                    continue
+                model = parts[0]
+                iface = (parts[1] if len(parts) > 1 else "").lower()
+                mtype = (parts[2] if len(parts) > 2 else "").lower()
+                guess = _guess_from_model(model)
+                if iface == "usb" or "removable" in mtype or guess == "usb":
+                    continue
+                if guess == "ssd":
+                    info.has_ssd = True
+                elif guess == "hdd":
+                    info.has_hdd = True
+        except Exception:
+            pass
 
 
 def _detect_network(info: HardwareInfo) -> None:
@@ -438,6 +503,31 @@ def _detect_network(info: HardwareInfo) -> None:
                                 break
                     except OSError:
                         continue
+    except Exception:
+        pass
+
+    # Adapter hardware description + Killer NIC detection. Killer/Rivet
+    # Networks cards ship with proprietary drivers that clash with the
+    # netsh/registry TCP tweaks we apply, so callers need to know when to
+    # skip those optimizations.
+    try:
+        if info.active_adapter_name:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-NetAdapter -Name '{info.active_adapter_name}' "
+                 f"-ErrorAction SilentlyContinue).InterfaceDescription"],
+                capture_output=True, text=True, timeout=6,
+                creationflags=_NO_WINDOW,
+            )
+            desc = (r.stdout or "").strip()
+            if desc:
+                info.active_adapter_description = desc
+            haystack = f"{info.active_adapter_name} {desc}".lower()
+            killer_markers = (
+                "killer", "rivet networks",
+                "killer e2400", "killer e2500", "killer e3000", "killer ax1650",
+            )
+            info.is_killer_nic = any(m in haystack for m in killer_markers)
     except Exception:
         pass
 

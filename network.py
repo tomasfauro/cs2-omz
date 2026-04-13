@@ -25,6 +25,31 @@ import hardware_detect
 
 Result = Tuple[bool, str]
 
+# Killer / Rivet Networks NICs (E2400, E2500, E3000, AX1650, ...) ship with
+# proprietary bandwidth-management drivers that break when the Windows TCP
+# stack is retuned via netsh or per-adapter registry tweaks — users have
+# lost connectivity entirely. Any op that touches the TCP stack must bail
+# out early when one of these adapters is active.
+KILLER_NIC_KEYWORDS = (
+    "killer", "rivet networks",
+    "killer e2400", "killer e2500", "killer e3000", "killer ax1650",
+)
+KILLER_SKIP_MESSAGE = (
+    "Killer NIC detected — TCP optimizations skipped to avoid "
+    "conflicts with Killer software"
+)
+
+
+def _is_killer_nic() -> bool:
+    info = hardware_detect.detect_all()
+    if getattr(info, "is_killer_nic", False):
+        return True
+    haystack = " ".join(filter(None, [
+        info.active_adapter_name,
+        getattr(info, "active_adapter_description", None),
+    ])).lower()
+    return any(k in haystack for k in KILLER_NIC_KEYWORDS)
+
 # Hide every spawned child window so the GUI never flashes a console.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -52,6 +77,8 @@ def _run(cmd: list[str], timeout: int = 20) -> Result:
 # -------------------- Nagle (per-adapter) --------------------
 
 def disable_nagle_algorithm() -> Result:
+    if _is_killer_nic():
+        return False, KILLER_SKIP_MESSAGE
     name, guid = _active_adapter()
     if not guid or not winreg:
         return False, "Active adapter GUID not found."
@@ -83,9 +110,10 @@ def check_nagle_adapter_status() -> bool:
 # -------------------- TCP stack --------------------
 
 def optimize_tcp_stack() -> Result:
+    if _is_killer_nic():
+        return False, KILLER_SKIP_MESSAGE
     cmds = [
         ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
-        ["netsh", "int", "tcp", "set", "global", "chimney=disabled"],
         ["netsh", "int", "tcp", "set", "global", "dca=enabled"],
         ["netsh", "int", "tcp", "set", "global", "ecncapability=disabled"],
         ["netsh", "int", "tcp", "set", "global", "timestamps=disabled"],
@@ -93,7 +121,7 @@ def optimize_tcp_stack() -> Result:
     ]
     for c in cmds:
         _run(c)
-    return True, "TCP stack tuned (RSS on, DCA on, chimney off, heuristics off)."
+    return True, "TCP stack tuned (RSS on, DCA on, ECN off, heuristics off)."
 
 
 def _ps_query(script: str, timeout: int = 8) -> str:
@@ -136,6 +164,8 @@ def check_tcp_stack_status() -> bool:
 # -------------------- TCP autotuning --------------------
 
 def disable_tcp_autotuning() -> Result:
+    if _is_killer_nic():
+        return False, KILLER_SKIP_MESSAGE
     return _run(["netsh", "int", "tcp", "set", "global", "autotuninglevel=disabled"])
 
 
@@ -448,17 +478,17 @@ def get_latency_comparison() -> dict:
 NETWORK_OPTIMIZATIONS = [
     ("disable_nagle_adapter", "Disable Nagle (Adapter)",
      "Disable Nagle on the active network adapter.",
-     disable_nagle_algorithm, check_nagle_adapter_status),
+     disable_nagle_algorithm, check_nagle_adapter_status, "Moderate", "Low"),
     ("optimize_tcp_stack", "Optimize TCP Stack",
-     "Tune RSS, DCA, chimney offload for low latency.",
-     optimize_tcp_stack, check_tcp_stack_status),
+     "Tune RSS, DCA, ECN, and heuristics for low latency.",
+     optimize_tcp_stack, check_tcp_stack_status, "Moderate", "Medium"),
     ("disable_tcp_autotuning", "Disable TCP Autotuning",
      "Reduce jitter by disabling TCP window autotuning.",
-     disable_tcp_autotuning, check_tcp_autotuning_status),
+     disable_tcp_autotuning, check_tcp_autotuning_status, "Caution", "Low"),
     ("set_qos_cs2", "Prioritize CS2 Traffic (QoS)",
      "Create a QoS policy tagging CS2 packets with DSCP 46.",
-     set_qos_cs2, check_qos_cs2_status),
+     set_qos_cs2, check_qos_cs2_status, "Safe", "Medium"),
     ("optimize_network_adapter", "Optimize Network Adapter",
      "Disable power saving and interrupt moderation on the active adapter.",
-     optimize_network_adapter, check_network_adapter_status),
+     optimize_network_adapter, check_network_adapter_status, "Safe", "Medium"),
 ]

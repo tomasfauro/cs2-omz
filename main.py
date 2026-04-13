@@ -42,23 +42,53 @@ def is_admin() -> bool:
 STATUS_ICONS = {"applied": "✅ Applied", "not_applied": "⚠️ Not applied", "error": "❌ Error"}
 
 
-class OptimizationRow(ctk.CTkFrame):
-    """A single row: checkbox + name + description + status."""
+RISK_COLORS = {
+    "Safe":     "#2e7d32",  # green
+    "Moderate": "#c9a227",  # yellow
+    "Caution":  "#e67e22",  # orange
+}
+IMPACT_COLORS = {
+    "High impact":   "#3b82f6",
+    "Medium impact": "#6b7280",
+    "Low impact":    "#6b7280",
+}
 
-    def __init__(self, master, key, title, desc, apply_fn, check_fn):
+
+class OptimizationRow(ctk.CTkFrame):
+    """A single row: checkbox + name + description + badges + status."""
+
+    def __init__(self, master, key, title, desc, apply_fn, check_fn,
+                 risk="Safe", impact="Low"):
         super().__init__(master, fg_color="transparent")
         self.key = key
         self.apply_fn = apply_fn
         self.check_fn = check_fn
 
         self.var = ctk.BooleanVar(value=False)
-        self.check = ctk.CTkCheckBox(self, text="", variable=self.var, width=24)
+        self.check = ctk.CTkCheckBox(self, text="", variable=self.var, width=24,
+                                     onvalue=True, offvalue=False)
         self.check.grid(row=0, column=0, rowspan=2, padx=(6, 10), pady=6)
 
-        self.title = ctk.CTkLabel(self, text=title, font=ctk.CTkFont(weight="bold"))
-        self.title.grid(row=0, column=1, sticky="w")
+        title_row = ctk.CTkFrame(self, fg_color="transparent")
+        title_row.grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(title_row, text=title,
+                     font=ctk.CTkFont(weight="bold")).pack(side="left")
 
-        self.desc = ctk.CTkLabel(self, text=desc, text_color="#9aa0a6", wraplength=420, justify="left")
+        risk_color = RISK_COLORS.get(risk, "#6b7280")
+        ctk.CTkLabel(title_row, text=f" {risk} ", text_color="white",
+                     fg_color=risk_color, corner_radius=6,
+                     font=ctk.CTkFont(size=11, weight="bold")
+                     ).pack(side="left", padx=(8, 0))
+
+        impact_label = f"{impact} impact"
+        impact_color = IMPACT_COLORS.get(impact_label, "#6b7280")
+        ctk.CTkLabel(title_row, text=f" {impact_label} ", text_color="white",
+                     fg_color=impact_color, corner_radius=6,
+                     font=ctk.CTkFont(size=11)
+                     ).pack(side="left", padx=(6, 0))
+
+        self.desc = ctk.CTkLabel(self, text=desc, text_color="#9aa0a6",
+                                 wraplength=420, justify="left")
         self.desc.grid(row=1, column=1, sticky="w")
 
         self.status = ctk.CTkLabel(self, text=STATUS_ICONS["not_applied"], width=120)
@@ -158,8 +188,11 @@ class App(ctk.CTk):
         scroll.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
 
         self.system_rows: list[OptimizationRow] = []
-        for key, title, desc, apply_fn, check_fn in optimizer.OPTIMIZATIONS:
-            row = OptimizationRow(scroll, key, title, desc, apply_fn, check_fn)
+        for entry in optimizer.OPTIMIZATIONS:
+            key, title, desc, apply_fn, check_fn = entry[:5]
+            risk, impact = (entry[5], entry[6]) if len(entry) >= 7 else ("Safe", "Low")
+            row = OptimizationRow(scroll, key, title, desc, apply_fn, check_fn,
+                                  risk=risk, impact=impact)
             row.pack(fill="x", padx=4, pady=4)
             self.system_rows.append(row)
 
@@ -222,8 +255,11 @@ class App(ctk.CTk):
         scroll.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
 
         self.network_rows: list[OptimizationRow] = []
-        for key, title, desc, apply_fn, check_fn in netmod.NETWORK_OPTIMIZATIONS:
-            row = OptimizationRow(scroll, key, title, desc, apply_fn, check_fn)
+        for entry in netmod.NETWORK_OPTIMIZATIONS:
+            key, title, desc, apply_fn, check_fn = entry[:5]
+            risk, impact = (entry[5], entry[6]) if len(entry) >= 7 else ("Safe", "Low")
+            row = OptimizationRow(scroll, key, title, desc, apply_fn, check_fn,
+                                  risk=risk, impact=impact)
             row.pack(fill="x", padx=4, pady=4)
             self.network_rows.append(row)
 
@@ -266,12 +302,10 @@ class App(ctk.CTk):
         self.launch_text.insert(0, self.launch_opts)
 
         explanations = {
-            "-novid": "Skip the intro video for faster launches.",
-            "-high": "Launch CS2 at High process priority.",
-            "-threads": "Use up to N CPU threads (capped at 8 for Source 2).",
+            "-mainthreadpriority 2": "Raise CS2 main thread priority for smoother frametimes.",
+            "+thread_pool_option 4": "Use the Source 2 worker thread pool tuned for gameplay.",
             "-w / -h": "Match your monitor's native resolution.",
             "+fps_max": "Cap FPS at 2x monitor refresh rate for stable frametimes.",
-            "+mat_queue_mode 2": "Enable multi-threaded material queue (16GB+ RAM).",
             "-allow_third_party_software": "Allow tools like RivaTuner/MSI Afterburner overlay.",
         }
         box = ctk.CTkScrollableFrame(root, height=320)

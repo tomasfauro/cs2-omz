@@ -103,6 +103,27 @@ Please keep each optimization:
 - Safe to run twice (idempotent).
 - Covered by a `check_*_status()` helper.
 
+## VAC Safe?
+
+**Yes — CS2 OMZ is 100% VAC safe.**
+
+CS2 OMZ only modifies **Windows system settings**: registry keys, services,
+power plans, TCP stack parameters, and network adapter properties. It does
+**not**:
+
+- Read, write, or modify any CS2 game file.
+- Attach to, inject into, or read memory from the `cs2.exe` process.
+- Hook DirectX, OpenGL, or any Source 2 API.
+- Load drivers or kernel modules.
+- Touch anything inside your Steam or CS2 install directory (except for
+  the optional **Clear CS2 Shader Cache** action, which deletes Valve's
+  own regeneratable shader cache folder — never game code or assets).
+
+Valve Anti-Cheat inspects the CS2 process and its loaded modules. Because
+CS2 OMZ runs entirely outside that boundary and exits before you launch
+the game, there is nothing for VAC to flag. The launch options it
+generates use only documented Source 2 engine flags.
+
 ## Disclaimer
 
 CS2 OMZ modifies Windows registry keys, services, and network settings.

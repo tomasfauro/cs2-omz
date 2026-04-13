@@ -316,9 +316,45 @@ def check_nagle_status() -> bool:
 
 # -------------------- SSD TRIM --------------------
 
-def optimize_ssd_trim() -> Result:
+def _debug_enumerate_drives() -> list[str]:
+    """Return a list of 'model -> guess' strings for every drive Windows
+    reports. Used by optimize_ssd_trim's debug path so we can see exactly
+    what model strings the keyword matcher is seeing."""
+    lines: list[str] = []
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_DiskDrive | "
+             "ForEach-Object { \"$($_.Model)|$($_.InterfaceType)|$($_.MediaType)\" }"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=_NO_WINDOW,
+        )
+        for raw in (r.stdout or "").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split("|")
+            model = parts[0] if parts else raw
+            iface = parts[1] if len(parts) > 1 else ""
+            mtype = parts[2] if len(parts) > 2 else ""
+            guess = hardware_detect._guess_from_model(model)
+            lines.append(f"  - '{model}' iface={iface} media={mtype} → {guess}")
+    except Exception as e:
+        lines.append(f"  (enumeration failed: {e})")
+    return lines
+
+
+def optimize_ssd_trim(debug: bool = True) -> Result:
     info = hardware_detect.detect_all()
     if not info.has_ssd:
+        if debug:
+            drives = _debug_enumerate_drives()
+            detail = "\n".join(drives) if drives else "  (no drives reported)"
+            return False, (
+                "Skipped: no SSD detected on this system.\n"
+                f"has_ssd={info.has_ssd} has_hdd={info.has_hdd}\n"
+                "Drives seen:\n" + detail
+            )
         return False, "Skipped: no SSD detected on this system."
     return _run(["fsutil", "behavior", "set", "DisableDeleteNotify", "0"])
 
@@ -416,7 +452,7 @@ def check_xbox_dvr_status() -> bool:
 
 # -------------------- Services --------------------
 
-_SERVICES = ["SysMain", "DiagTrack", "WSearch", "Spooler"]
+_SERVICES = ["DiagTrack", "WSearch", "Spooler"]
 
 # Note: disabling "Spooler" stops all printing until re-enabled. The
 # original start type of every service is snapshotted to this JSON file
@@ -514,7 +550,6 @@ def optimize_ram_settings() -> Result:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MM_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, "LargeSystemCache", 0, winreg.REG_DWORD, 0)
-            winreg.SetValueEx(k, "DisablePagingExecutive", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(k, "ClearPageFileAtShutdown", 0, winreg.REG_DWORD, 0)
         return True, "Memory management tuned for gaming."
     except Exception as e:
@@ -522,8 +557,10 @@ def optimize_ram_settings() -> Result:
 
 
 def check_ram_settings_status() -> bool:
-    return _reg_read(winreg.HKEY_LOCAL_MACHINE, _MM_KEY, "DisablePagingExecutive") == 1 \
-        if winreg else False
+    if not winreg:
+        return False
+    return _reg_read(winreg.HKEY_LOCAL_MACHINE, _MM_KEY, "LargeSystemCache") == 0 \
+        and _reg_read(winreg.HKEY_LOCAL_MACHINE, _MM_KEY, "ClearPageFileAtShutdown") == 0
 
 
 # -------------------- Shader cache --------------------
@@ -581,15 +618,11 @@ def check_visual_effects_status() -> bool:
 
 def generate_launch_options() -> str:
     info = hardware_detect.detect_all()
-    opts: list[str] = ["-novid", "-high"]
-    if info.cpu_threads:
-        opts.append(f"-threads {min(info.cpu_threads, 8)}")
+    opts: list[str] = ["-mainthreadpriority 2", "+thread_pool_option 4"]
     if info.monitor_width and info.monitor_height:
         opts += [f"-w {info.monitor_width}", f"-h {info.monitor_height}"]
     if info.monitor_hz:
         opts.append(f"+fps_max {info.monitor_hz * 2}")
-    if info.ram_total_gb and info.ram_total_gb >= 16:
-        opts.append("+mat_queue_mode 2")
     opts.append("-allow_third_party_software")
     return " ".join(opts)
 
@@ -598,40 +631,43 @@ def generate_launch_options() -> str:
 
 OPTIMIZATIONS = [
     ("disable_hpet", "Disable HPET",
-     "Disable High Precision Event Timer for lower latency.",
-     disable_hpet, check_hpet_status),
+     "Disable High Precision Event Timer for lower latency. "
+     "⚠ May be harmful on modern platforms — use with caution.",
+     disable_hpet, check_hpet_status, "Caution", "Low"),
     ("disable_core_parking", "Disable Core Parking",
-     "Keep all CPU cores unparked (Intel and AMD).",
-     disable_core_parking, check_core_parking_status),
+     "Keep all CPU cores unparked (Intel and AMD). "
+     "⚠ May increase temperatures and power consumption on modern CPUs.",
+     disable_core_parking, check_core_parking_status, "Moderate", "Medium"),
     ("set_high_performance_plan", "High Performance Power Plan",
      "Activate Windows High Performance power plan.",
-     set_high_performance_plan, check_high_performance_status),
+     set_high_performance_plan, check_high_performance_status, "Safe", "Medium"),
     ("enable_msi_mode_nvidia", "Enable NVIDIA MSI Mode",
      "Enable Message Signaled Interrupts on NVIDIA GPU.",
-     enable_msi_mode_nvidia, check_msi_mode_nvidia_status),
+     enable_msi_mode_nvidia, check_msi_mode_nvidia_status, "Safe", "Medium"),
     ("disable_nagle_algorithm", "Disable Nagle (System)",
      "Disable Nagle on all TCP interfaces.",
-     disable_nagle_algorithm, check_nagle_status),
+     disable_nagle_algorithm, check_nagle_status, "Moderate", "Low"),
     ("optimize_ssd_trim", "Enable SSD TRIM",
      "Enable TRIM so SSDs stay responsive.",
-     optimize_ssd_trim, check_ssd_trim_status),
+     optimize_ssd_trim, check_ssd_trim_status, "Safe", "Low"),
     ("disable_fullscreen_optimizations_cs2", "Disable CS2 Fullscreen Opt.",
      "Force real fullscreen on cs2.exe.",
-     disable_fullscreen_optimizations_cs2, check_fullscreen_optimizations_cs2_status),
+     disable_fullscreen_optimizations_cs2, check_fullscreen_optimizations_cs2_status,
+     "Safe", "Medium"),
     ("disable_xbox_dvr", "Disable Xbox Game DVR",
      "Turn off Game Bar / DVR recording (7 registry keys).",
-     disable_xbox_dvr, check_xbox_dvr_status),
+     disable_xbox_dvr, check_xbox_dvr_status, "Safe", "High"),
     ("disable_unnecessary_services", "Disable Background Services",
-     "SysMain, DiagTrack, WSearch, PrintSpooler. ⚠ Disabling Spooler "
+     "DiagTrack, WSearch, PrintSpooler. ⚠ Disabling Spooler "
      "stops printing until you click Revert Changes.",
-     disable_unnecessary_services, check_services_status),
+     disable_unnecessary_services, check_services_status, "Moderate", "Low"),
     ("optimize_ram_settings", "Optimize Memory Settings",
      "Tune Memory Management for gaming workloads.",
-     optimize_ram_settings, check_ram_settings_status),
+     optimize_ram_settings, check_ram_settings_status, "Safe", "Low"),
     ("clear_cs2_shader_cache", "Clear CS2 Shader Cache",
      "Delete shader caches so they rebuild cleanly.",
-     clear_cs2_shader_cache, check_shader_cache_status),
+     clear_cs2_shader_cache, check_shader_cache_status, "Safe", "High"),
     ("reduce_visual_effects", "Reduce Visual Effects",
      "Windows 'Best performance' visual preset.",
-     reduce_visual_effects, check_visual_effects_status),
+     reduce_visual_effects, check_visual_effects_status, "Safe", "Low"),
 ]
