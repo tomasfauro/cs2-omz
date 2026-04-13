@@ -285,25 +285,108 @@ def _detect_steam(info: HardwareInfo) -> None:
             break
 
 
+# Keywords that strongly indicate an SSD from a Win32_DiskDrive.Model string.
+# MSFT_PhysicalDisk.MediaType is authoritative when Windows populates it, but
+# many SATA SSDs (Samsung 850 EVO among them) report MediaType = 0 (Unspecified),
+# so the model-name fallback has to be robust.
+_SSD_KEYWORDS = (
+    "ssd", "nvme", "m.2",
+    "evo", "qvo", "pro",          # Samsung
+    "kingston", "a400", "kc", "sa400", "nv1", "nv2",  # Kingston
+    "crucial", "mx500", "bx500", "p1", "p2", "p3", "p5",  # Crucial
+    "wd blue sn", "wd black sn", "wd green sn", "wd_black",  # WD SSDs
+    "intel ssd", "660p", "670p", "760p", "optane",  # Intel
+    "sandisk ssd", "plextor", "adata", "corsair force",  # misc
+    "970", "980", "990",          # Samsung NVMe series
+    "850", "860", "870", "883", "893", "pm",            # Samsung SATA/enterprise
+    "firecuda", "barracuda ssd", "ironwolf ssd",        # Seagate SSDs
+)
+
+# Keywords that indicate a spinning disk even if "ssd" appears elsewhere.
+_HDD_KEYWORDS = ("hdd", "hitachi", "wd blue wd", "barracuda", "deskstar",
+                 "caviar", "ironwolf ", "red wd", "skyhawk")
+
+
+def _guess_from_model(model: str) -> str:
+    """Return 'ssd', 'hdd', or 'unknown' from a drive model string."""
+    m = (model or "").lower().strip()
+    if not m:
+        return "unknown"
+    # SSD wins over HDD if both hit — "Samsung SSD 850 EVO" contains no HDD
+    # token, but mixed generic names like "WD Blue SSD" must classify as SSD.
+    if any(k in m for k in _SSD_KEYWORDS):
+        return "ssd"
+    if any(k in m for k in _HDD_KEYWORDS):
+        return "hdd"
+    return "unknown"
+
+
 def _detect_storage(info: HardwareInfo) -> None:
-    """Detect if any SSD/HDD is present. Uses MSFT_PhysicalDisk.MediaType:
-    3=HDD, 4=SSD, 5=SCM. Falls back to Win32_DiskDrive MediaType string."""
+    """Detect if any SSD/HDD is present.
+
+    Primary source: MSFT_PhysicalDisk.MediaType (3=HDD, 4=SSD, 5=SCM).
+    Fallback: Win32_DiskDrive.Model keyword match — needed because many
+    SATA SSDs (e.g. Samsung 850 EVO) report MediaType=0 (Unspecified) and
+    would otherwise go undetected.
+    """
+    if not wmi:
+        return
+
+    classified_any = False
+    # ---- Primary: MSFT_PhysicalDisk ----
     try:
-        if wmi:
-            try:
-                c = wmi.WMI(namespace=r"root\Microsoft\Windows\Storage")
-                for d in c.MSFT_PhysicalDisk():
-                    mt = int(getattr(d, "MediaType", 0) or 0)
-                    if mt == 4:
-                        info.has_ssd = True
-                    elif mt == 3:
-                        info.has_hdd = True
-            except Exception:
-                # Namespace not available — try legacy WMI
-                c = wmi.WMI()
-                for d in c.Win32_DiskDrive():
-                    model = (d.Model or "").lower()
-                    if "ssd" in model or "nvme" in model:
+        c = wmi.WMI(namespace=r"root\Microsoft\Windows\Storage")
+        for d in c.MSFT_PhysicalDisk():
+            mt = int(getattr(d, "MediaType", 0) or 0)
+            if mt == 4:
+                info.has_ssd = True
+                classified_any = True
+            elif mt == 3:
+                info.has_hdd = True
+                classified_any = True
+            else:
+                # MediaType=0 (Unspecified) — try the FriendlyName as hint
+                guess = _guess_from_model(getattr(d, "FriendlyName", "") or "")
+                if guess == "ssd":
+                    info.has_ssd = True
+                    classified_any = True
+                elif guess == "hdd":
+                    info.has_hdd = True
+                    classified_any = True
+    except Exception:
+        pass
+
+    # ---- Fallback: Win32_DiskDrive model-name keyword match ----
+    # Runs whenever we still have unclassified drives (either the namespace
+    # was unavailable, or every drive reported MediaType=0 with no hints).
+    try:
+        c = wmi.WMI()
+        for d in c.Win32_DiskDrive():
+            model = d.Model or ""
+            # Skip USB sticks / removable media — their brand names overlap
+            # with SSD brands (e.g. "Kingston DataTraveler" USB flash).
+            iface = (getattr(d, "InterfaceType", "") or "").lower()
+            mtype = (getattr(d, "MediaType", "") or "").lower()
+            if iface == "usb" or "removable" in mtype or "datatraveler" in model.lower():
+                continue
+            guess = _guess_from_model(model)
+            if guess == "ssd":
+                info.has_ssd = True
+            elif guess == "hdd":
+                info.has_hdd = True
+            elif not classified_any:
+                # Last resort: InterfaceType + MediaType string.
+                iface = (getattr(d, "InterfaceType", "") or "").lower()
+                mtype = (getattr(d, "MediaType", "") or "").lower()
+                if "fixed hard disk" in mtype or iface == "ide":
+                    # Still ambiguous — SATA drives can be SSD or HDD.
+                    # Heuristic: if model string has a digit pattern typical
+                    # of SSD capacities (120/240/250/480/500/1TB) alongside
+                    # "Samsung"/"Crucial"/"Kingston", call it SSD.
+                    lm = model.lower()
+                    if any(v in lm for v in ("samsung", "crucial", "kingston",
+                                             "sandisk", "intel", "adata",
+                                             "corsair")):
                         info.has_ssd = True
                     else:
                         info.has_hdd = True
