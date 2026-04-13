@@ -1,5 +1,5 @@
 # CS2 OMZ
-
+CS2 OPTIMIZER
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
