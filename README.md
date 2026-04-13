@@ -124,6 +124,26 @@ CS2 OMZ runs entirely outside that boundary and exits before you launch
 the game, there is nothing for VAC to flag. The launch options it
 generates use only documented Source 2 engine flags.
 
+## VirusTotal / Antivirus
+
+A scan of `CS2OMZ.exe` on VirusTotal shows **4 / 72 vendors** flagging the
+file. This is a well-known false positive associated with any
+[PyInstaller](https://pyinstaller.org/) executable that requests
+administrator privileges via `--uac-admin` — the PyInstaller bootloader
+is a common template that a handful of heuristic scanners fingerprint,
+regardless of what the bundled Python code actually does.
+
+CS2 OMZ is **fully open source**. If you don't want to trust the
+prebuilt binary, verify it yourself:
+
+- Read every line of source in this repository.
+- Build your own `CS2OMZ.exe` from source with `build.bat`.
+- Compare the SHA-256 hash published on the GitHub Release page with
+  the hash of the file you downloaded.
+
+If any vendor outside the usual PyInstaller-bootloader set flags the
+binary, please open an issue.
+
 ## Disclaimer
 
 CS2 OMZ modifies Windows registry keys, services, and network settings.
