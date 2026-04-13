@@ -3,7 +3,7 @@
 CustomTkinter-based dark GUI (900x650) divided into three tabs:
   * System     — hardware info + system optimizations
   * Network    — active adapter info, network optimizations, DNS, ping test
-  * Launch Options — personalized CS2 launch options from detected hardware
+  * Game Config  — CS2 direct optimizations (UDP, autoexec) + launch options
 """
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ class App(ctk.CTk):
         self._build_tabs()
         self._build_system_tab()
         self._build_network_tab()
-        self._build_launch_tab()
+        self._build_gameconfig_tab()
 
         # Auto-detect applied status on startup
         self.after(100, self._refresh_all_statuses)
@@ -147,7 +147,7 @@ class App(ctk.CTk):
         self.tabs.pack(fill="both", expand=True, padx=10, pady=10)
         self.tab_system = self.tabs.add("System")
         self.tab_network = self.tabs.add("Network")
-        self.tab_launch = self.tabs.add("Launch Options")
+        self.tab_gameconfig = self.tabs.add("Game Config")
 
     # ---------- system tab ----------
     def _build_system_tab(self):
@@ -255,6 +255,10 @@ class App(ctk.CTk):
         scroll.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
 
         self.network_rows: list[OptimizationRow] = []
+
+        ctk.CTkLabel(scroll, text="Windows Background Network",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#9aa0a6").pack(anchor="w", padx=6, pady=(6, 2))
         for entry in netmod.NETWORK_OPTIMIZATIONS:
             key, title, desc, apply_fn, check_fn = entry[:5]
             risk, impact = (entry[5], entry[6]) if len(entry) >= 7 else ("Safe", "Low")
@@ -289,16 +293,55 @@ class App(ctk.CTk):
         self.network_log = ctk.CTkTextbox(root, height=110)
         self.network_log.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
-    # ---------- launch tab ----------
-    def _build_launch_tab(self):
-        root = self.tab_launch
-        ctk.CTkLabel(root, text="Personalized Launch Options",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=16, pady=(12, 4))
+    # ---------- game config tab ----------
+    def _build_gameconfig_tab(self):
+        root = self.tab_gameconfig
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_columnconfigure(1, weight=1)
+        root.grid_rowconfigure(0, weight=1)
+
+        # Left: CS2 Direct Optimizations (UDP opts)
+        left = ctk.CTkFrame(root)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="CS2 Direct Optimizations",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(
+                         row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        scroll = ctk.CTkScrollableFrame(left)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+
+        self.gameconfig_rows: list[OptimizationRow] = []
+        for entry in netmod.UDP_OPTIMIZATIONS:
+            key, title, desc, apply_fn, check_fn = entry[:5]
+            risk, impact = (entry[5], entry[6]) if len(entry) >= 7 else ("Safe", "Low")
+            row = OptimizationRow(scroll, key, title, desc, apply_fn, check_fn,
+                                  risk=risk, impact=impact)
+            row.pack(fill="x", padx=4, pady=4)
+            self.gameconfig_rows.append(row)
+
+        btns = ctk.CTkFrame(left, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
+        ctk.CTkButton(btns, text="Apply CS2 Optimizations",
+                      command=self._run_gameconfig).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Revert", fg_color="#b23a3a",
+                      hover_color="#8c2c2c",
+                      command=self._revert_changes).pack(side="left", padx=4)
+
+        # Right: Launch Options
+        right = ctk.CTkFrame(root)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(right, text="Personalized Launch Options",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(
+                         row=0, column=0, sticky="w", padx=12, pady=(12, 4))
 
         self.launch_opts = optimizer.generate_launch_options()
-        self.launch_text = ctk.CTkEntry(root, height=40,
-                                        font=ctk.CTkFont(size=14))
-        self.launch_text.pack(fill="x", padx=16, pady=4)
+        self.launch_text = ctk.CTkEntry(right, height=40, font=ctk.CTkFont(size=13))
+        self.launch_text.grid(row=1, column=0, sticky="ew", padx=12, pady=4)
         self.launch_text.insert(0, self.launch_opts)
 
         explanations = {
@@ -308,21 +351,25 @@ class App(ctk.CTk):
             "+fps_max": "Cap FPS at 2x monitor refresh rate for stable frametimes.",
             "-allow_third_party_software": "Allow tools like RivaTuner/MSI Afterburner overlay.",
         }
-        box = ctk.CTkScrollableFrame(root, height=320)
-        box.pack(fill="both", expand=True, padx=16, pady=8)
+        box = ctk.CTkScrollableFrame(right)
+        box.grid(row=2, column=0, sticky="nsew", padx=12, pady=4)
         for k, v in explanations.items():
             fr = ctk.CTkFrame(box, fg_color="transparent")
             fr.pack(fill="x", pady=2)
             ctk.CTkLabel(fr, text=k, font=ctk.CTkFont(weight="bold"),
-                         width=240, anchor="w").pack(side="left", padx=8)
+                         width=200, anchor="w").pack(side="left", padx=8)
             ctk.CTkLabel(fr, text=v, text_color="#9aa0a6",
-                         wraplength=560, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
+                         wraplength=380, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
 
-        ctk.CTkButton(root, text="Copy to Clipboard",
-                      command=self._copy_launch).pack(pady=6)
-        ctk.CTkLabel(root,
-                     text="⚠ Remove any conflicting launch options you may already have in Steam before pasting.",
-                     text_color="#e0a23c").pack(pady=(4, 12), padx=16)
+        ctk.CTkButton(right, text="Copy to Clipboard",
+                      command=self._copy_launch).grid(row=3, column=0, pady=6)
+        ctk.CTkLabel(right,
+                     text="⚠ Remove conflicting launch options in Steam before pasting.",
+                     text_color="#e0a23c").grid(row=4, column=0, pady=(2, 10), padx=12)
+
+        # Log
+        self.gameconfig_log = ctk.CTkTextbox(root, height=110)
+        self.gameconfig_log.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     # -------------------- actions --------------------
     def _log(self, box, msg: str):
@@ -335,6 +382,8 @@ class App(ctk.CTk):
             row.refresh_status()
         for row in self.network_rows:
             row.refresh_status()
+        for row in self.gameconfig_rows:
+            row.refresh_status()
 
     def _run_system(self, selected_only: bool):
         rows = [r for r in self.system_rows if (r.var.get() or not selected_only)]
@@ -346,6 +395,11 @@ class App(ctk.CTk):
     def _run_network(self):
         threading.Thread(target=self._run_rows,
                          args=(self.network_rows, self.network_log),
+                         daemon=True).start()
+
+    def _run_gameconfig(self):
+        threading.Thread(target=self._run_rows,
+                         args=(self.gameconfig_rows, self.gameconfig_log),
                          daemon=True).start()
 
     def _run_rows(self, rows, log_box):

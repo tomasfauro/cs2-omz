@@ -235,16 +235,56 @@ def _detect_monitor(info: HardwareInfo) -> None:
         info.monitor_height = user32.GetSystemMetrics(1)
     except Exception:
         pass
+    # --- Refresh rate detection (three methods, most-reliable first) ---
+
+    # Method 1: GetDeviceCaps(VREFRESH) on the primary display DC.
+    # This queries the actual active display output, not the GPU adapter
+    # record, so it is immune to integrated-GPU / multi-adapter confusion.
+    _VREFRESH = 116  # GDI constant
     try:
-        # Refresh rate via WMI
-        if wmi:
-            c = wmi.WMI()
-            for m in c.Win32_VideoController():
-                if m.CurrentRefreshRate:
-                    info.monitor_hz = int(m.CurrentRefreshRate)
-                    break
+        import ctypes
+        gdi32 = ctypes.windll.gdi32
+        hdc = ctypes.windll.user32.GetDC(None)  # primary display DC
+        if hdc:
+            hz = gdi32.GetDeviceCaps(hdc, _VREFRESH)
+            ctypes.windll.user32.ReleaseDC(None, hdc)
+            if hz > 0:
+                info.monitor_hz = hz
     except Exception:
         pass
+
+    # Method 2: Win32_DesktopMonitor via WMI.
+    # More accurate than Win32_VideoController because it reflects the
+    # monitor connection rather than the GPU adapter entry.
+    if info.monitor_hz <= 0 and wmi:
+        try:
+            c = wmi.WMI()
+            rates = [
+                int(m.ScreenRefreshRate)
+                for m in c.Win32_DesktopMonitor()
+                if getattr(m, "ScreenRefreshRate", None)
+                and int(m.ScreenRefreshRate) > 0
+            ]
+            if rates:
+                info.monitor_hz = max(rates)
+        except Exception:
+            pass
+
+    # Method 3: Win32_VideoController — least reliable (may report the
+    # integrated GPU rate instead of the active display), kept as last resort.
+    if info.monitor_hz <= 0 and wmi:
+        try:
+            c = wmi.WMI()
+            rates = [
+                int(m.CurrentRefreshRate)
+                for m in c.Win32_VideoController()
+                if getattr(m, "CurrentRefreshRate", None)
+                and int(m.CurrentRefreshRate) > 0
+            ]
+            if rates:
+                info.monitor_hz = max(rates)
+        except Exception:
+            pass
 
 
 def _detect_steam(info: HardwareInfo) -> None:

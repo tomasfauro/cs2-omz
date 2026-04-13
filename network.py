@@ -80,6 +80,8 @@ def disable_nagle_algorithm() -> Result:
 
 
 def check_nagle_adapter_status() -> bool:
+    if _is_killer_nic():
+        return False
     _, guid = _active_adapter()
     if not guid or not winreg:
         return False
@@ -139,6 +141,8 @@ def check_tcp_stack_status() -> bool:
     structured English values regardless of the system locale (netsh
     output is localized and breaks string matching).
     """
+    if _is_killer_nic():
+        return False
     try:
         rss = _ps_query("(Get-NetOffloadGlobalSetting).ReceiveSideScaling")
         if rss.lower() != "enabled":
@@ -167,6 +171,8 @@ def disable_tcp_autotuning() -> Result:
 
 def check_tcp_autotuning_status() -> bool:
     """True when AutoTuningLevelLocal is Disabled on the Internet profile."""
+    if _is_killer_nic():
+        return False
     val = _ps_query(
         "(Get-NetTCPSetting -SettingName Internet "
         "-ErrorAction SilentlyContinue).AutoTuningLevelLocal")
@@ -237,10 +243,18 @@ def check_network_adapter_status() -> bool:
     """Considered applied when power-saving is off AND at least one of the
     advanced properties we touched (interrupt moderation / EEE / flow
     control) is Disabled. We don't require all three because some NICs
-    don't expose every property — missing ones return empty strings."""
+    don't expose every property — missing ones return empty strings.
+
+    Killer NICs expose different property names for interrupt moderation
+    and related settings, so the advanced-property check is skipped for
+    them. Power management is always set by optimize_network_adapter()
+    regardless of NIC vendor, so it is sufficient as the sole indicator
+    on Killer hardware.
+    """
     name, _ = _active_adapter()
     if not name:
         return False
+
     script = (
         f"$n='{name}'; "
         "$p=(Get-NetAdapterPowerManagement -Name $n -ErrorAction SilentlyContinue)."
@@ -472,22 +486,308 @@ def get_latency_comparison() -> dict:
     return {"before": _load_results("before"), "after": _load_results("after")}
 
 
+# -------------------- UDP buffer (AFD) --------------------
+
+_AFD_KEY = r"SYSTEM\CurrentControlSet\Services\AFD\Parameters"
+_UDP_BUFFER_SIZE = 1048576  # 1 MB
+
+
+def optimize_udp_buffer() -> Result:
+    """Set Windows AFD receive/send window to 1 MB to reduce UDP packet loss."""
+    if not winreg:
+        return False, "winreg unavailable."
+    bok, bmsg = _ensure_backup([f"HKLM\\{_AFD_KEY}"], "udp_buffer")
+    if not bok:
+        return False, bmsg
+    try:
+        with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, _AFD_KEY) as k:
+            winreg.SetValueEx(k, "DefaultReceiveWindow", 0,
+                              winreg.REG_DWORD, _UDP_BUFFER_SIZE)
+            winreg.SetValueEx(k, "DefaultSendWindow", 0,
+                              winreg.REG_DWORD, _UDP_BUFFER_SIZE)
+        return True, f"UDP buffer set to {_UDP_BUFFER_SIZE // 1024} KB (AFD)."
+    except Exception as e:
+        return False, str(e)
+
+
+def check_udp_buffer_status() -> bool:
+    if not winreg:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _AFD_KEY) as k:
+            rx = winreg.QueryValueEx(k, "DefaultReceiveWindow")[0]
+            tx = winreg.QueryValueEx(k, "DefaultSendWindow")[0]
+            return rx >= _UDP_BUFFER_SIZE and tx >= _UDP_BUFFER_SIZE
+    except OSError:
+        return False
+
+
+# -------------------- CS2 autoexec --------------------
+
+_AUTOEXEC_MARKER = "// CS2-OMZ"
+_AUTOEXEC_END_MARKER = "// end CS2-OMZ"
+
+# Structured sections written inside the CS2-OMZ block.
+# Each entry is (section_label, [(cvar, value), ...]).
+_AUTOEXEC_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Network", [
+        ("rate",                      "786432"),
+        ("cl_interp_ratio",           "1"),
+        ("cl_interp",                 "0"),
+        ("cl_cmdrate",                "128"),
+        ("cl_updaterate",             "128"),
+        ("net_maxroutable",           "1200"),
+        ("net_splitpacket_maxrate",   "150000"),
+    ]),
+    ("Performance", [
+        # fps_max is intentionally absent here — resolved dynamically at
+        # generation time via _resolve_fps_max() so it reflects the detected
+        # monitor refresh rate.
+        ("r_dynamic",                     "0"),
+        ("mat_monitorgamma",              "2.2"),
+        ("cl_forcepreload",               "1"),
+        ("cl_disablehtmlmotd",            "1"),
+        ("r_drawtracers_firstperson",     "0"),
+        ("func_break_max_pieces",         "0"),
+    ]),
+    ("Mouse", [
+        ("m_rawinput",                  "1"),
+        ("m_mouseaccel1",               "0"),
+        ("m_mouseaccel2",               "0"),
+        ("zoom_sensitivity_ratio_mouse", "1.0"),
+    ]),
+    ("HUD", [
+        ("hud_scaling",         "0.85"),
+        ("cl_hud_radar_scale",  "1.15"),
+    ]),
+    ("Competitive", [
+        ("cl_autohelp",           "0"),
+        ("cl_showhelp",           "0"),
+        ("gameinstructor_enable", "0"),
+    ]),
+    ("Audio", [
+        ("snd_mixahead",                  "0.05"),
+        ("snd_headphone_pan_exponent",    "2"),
+    ]),
+]
+
+# Flat set of every cvar name we manage (used for duplicate stripping).
+# fps_max is added explicitly because it is resolved dynamically and not
+# present in _AUTOEXEC_SECTIONS, but we still own it and must deduplicate it.
+_AUTOEXEC_CVARS: set[str] = (
+    {cvar for _, pairs in _AUTOEXEC_SECTIONS for cvar, _ in pairs}
+    | {"fps_max"}
+)
+
+_FPS_MAX_FALLBACK = 240
+
+
+def _resolve_fps_max() -> str:
+    """Return fps_max as monitor_hz * 2, falling back to 240.
+
+    monitor_hz is declared as int in HardwareInfo but WMI can return a
+    float or numeric string on some systems.  We force conversion through
+    float first (handles "120", "120.0", 120, 120.0) then truncate to int
+    before multiplying, so the result is always a clean integer string.
+    """
+    try:
+        hz = hardware_detect.detect_all().monitor_hz
+        hz_int = int(float(hz))  # float() handles str/float/int uniformly
+        if hz_int > 0:
+            return str(hz_int * 2)
+    except Exception:
+        pass
+    return str(_FPS_MAX_FALLBACK)
+
+
+def _build_autoexec_block(fps_max: str) -> str:
+    """Render the full CS2-OMZ block as a string.
+
+    ``fps_max`` is passed in rather than read from ``_AUTOEXEC_SECTIONS``
+    because it is derived from the detected monitor refresh rate at
+    generation time.
+    """
+    lines: list[str] = [f"{_AUTOEXEC_MARKER}\n"]
+    for section, pairs in _AUTOEXEC_SECTIONS:
+        lines.append(f"// -- {section} --\n")
+        if section == "Performance":
+            lines.append(
+                f"// fps_max set to monitor_hz x2 ({fps_max}). "
+                "For best frametimes use an external limiter "
+                "(NVCP or RivaTuner) set slightly below this value.\n"
+            )
+            lines.append(f"fps_max {fps_max}\n")
+        for cvar, value in pairs:
+            lines.append(f"{cvar} {value}\n")
+    lines.append(f"{_AUTOEXEC_END_MARKER}\n")
+    return "".join(lines)
+
+
+def _cs2_cfg_path() -> str | None:
+    """Return the CS2 cfg directory, or None if CS2 is not found."""
+    cs2 = hardware_detect.detect_all().cs2_path
+    if not cs2:
+        return None
+    candidate = os.path.join(cs2, "game", "csgo", "cfg")
+    return candidate if os.path.isdir(candidate) else None
+
+
+def generate_cs2_autoexec() -> Result:
+    """Create or update CS2 autoexec.cfg with network, performance, mouse,
+    gameplay, and audio settings organised in labelled sections."""
+    cfg_dir = _cs2_cfg_path()
+    if not cfg_dir:
+        return False, "CS2 cfg folder not found. Verify your CS2 installation."
+    autoexec = os.path.join(cfg_dir, "autoexec.cfg")
+
+    # Backup the existing file before touching it.
+    try:
+        backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        if os.path.isfile(autoexec):
+            import shutil
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(autoexec,
+                         os.path.join(backup_dir, f"autoexec_{ts}.cfg.bak"))
+    except Exception as e:
+        return False, f"Backup failed: {e}"
+
+    # Read the existing file, strip:
+    #   1. Any previous CS2-OMZ block (between markers).
+    #   2. Any bare cvar lines whose name matches one we are about to write,
+    #      so there are no duplicate definitions left in the user's own section.
+    kept_lines: list[str] = []
+    if os.path.isfile(autoexec):
+        try:
+            with open(autoexec, "r", encoding="utf-8") as f:
+                raw = f.readlines()
+            in_omz_block = False
+            for line in raw:
+                stripped = line.strip()
+                # Toggle block-skip on our markers.
+                if stripped == _AUTOEXEC_MARKER:
+                    in_omz_block = True
+                    continue
+                if stripped == _AUTOEXEC_END_MARKER:
+                    in_omz_block = False
+                    continue
+                if in_omz_block:
+                    continue
+                # Outside our block: drop lines that set a cvar we own.
+                # A cvar line looks like:   cvar_name [value] [; ...]
+                # We only match lines where the first whitespace-separated
+                # token (ignoring a leading semicolon) is a managed cvar.
+                first_token = stripped.lstrip(";").split()[0] if stripped.lstrip(";").split() else ""
+                if first_token in _AUTOEXEC_CVARS:
+                    continue
+                kept_lines.append(line)
+        except Exception:
+            kept_lines = []
+
+    fps_max = _resolve_fps_max()
+    try:
+        with open(autoexec, "w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+            # Ensure a blank separator before our block.
+            if kept_lines and not kept_lines[-1].endswith("\n"):
+                f.write("\n")
+            f.write("\n")
+            f.write(_build_autoexec_block(fps_max))
+        return True, f"autoexec.cfg updated at {autoexec} (fps_max {fps_max})"
+    except Exception as e:
+        return False, str(e)
+
+
+def check_cs2_autoexec_status() -> bool:
+    cfg_dir = _cs2_cfg_path()
+    if not cfg_dir:
+        return False
+    autoexec = os.path.join(cfg_dir, "autoexec.cfg")
+    if not os.path.isfile(autoexec):
+        return False
+    try:
+        with open(autoexec, "r", encoding="utf-8") as f:
+            return _AUTOEXEC_MARKER in f.read()
+    except Exception:
+        return False
+
+
+# -------------------- UDP-specific QoS for CS2 (port 27005) --------------------
+
+_QOS_UDP_KEY = r"SOFTWARE\Policies\Microsoft\Windows\QoS\CS2-UDP-OMZ"
+
+
+def optimize_qos_udp_cs2() -> Result:
+    """Create a QoS policy targeting CS2 UDP traffic on port 27005 (DSCP 46)."""
+    if not winreg:
+        return False, "winreg unavailable."
+    cs2 = hardware_detect.detect_all().cs2_path
+    exe_path = ""
+    if cs2:
+        candidate = os.path.join(cs2, "game", "bin", "win64", "cs2.exe")
+        if os.path.isfile(candidate):
+            exe_path = candidate
+    bok, bmsg = _ensure_backup(
+        ["HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\QoS"], "qos_udp")
+    if not bok:
+        return False, bmsg
+    try:
+        with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, _QOS_UDP_KEY) as k:
+            winreg.SetValueEx(k, "Version", 0, winreg.REG_SZ, "1.0")
+            winreg.SetValueEx(k, "Application Name", 0, winreg.REG_SZ,
+                              exe_path or "cs2.exe")
+            winreg.SetValueEx(k, "Protocol", 0, winreg.REG_SZ, "UDP")
+            winreg.SetValueEx(k, "Local Port", 0, winreg.REG_SZ, "*")
+            winreg.SetValueEx(k, "Remote Port", 0, winreg.REG_SZ, "27005")
+            winreg.SetValueEx(k, "DSCP Value", 0, winreg.REG_SZ, "46")
+            winreg.SetValueEx(k, "Throttle Rate", 0, winreg.REG_SZ, "-1")
+        return True, "UDP QoS policy for CS2 port 27005 created (DSCP 46)."
+    except Exception as e:
+        return False, str(e)
+
+
+def check_qos_udp_cs2_status() -> bool:
+    if not winreg:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _QOS_UDP_KEY):
+            return True
+    except OSError:
+        return False
+
+
 # -------------------- Registry of network ops for the GUI --------------------
 
+# TCP / Windows background network optimizations
 NETWORK_OPTIMIZATIONS = [
     ("disable_nagle_adapter", "Disable Nagle (Adapter)",
-     "Disable Nagle on the active network adapter.",
+     "Reduces TCP ACK delays on the active adapter — lowers background Steam/Windows TCP overhead, not CS2 UDP packets.",
      disable_nagle_algorithm, check_nagle_adapter_status, "Moderate", "Low"),
     ("optimize_tcp_stack", "Optimize TCP Stack",
-     "Tune RSS, DCA, ECN, and heuristics for low latency.",
+     "Tunes RSS, DCA, ECN, and TCP heuristics — reduces background Windows TCP traffic overhead, not CS2 game packets.",
      optimize_tcp_stack, check_tcp_stack_status, "Moderate", "Medium"),
     ("disable_tcp_autotuning", "Disable TCP Autotuning",
-     "Reduce jitter by disabling TCP window autotuning.",
+     "Disables TCP window autotuning — reduces jitter from background Steam/Windows TCP services, not CS2 UDP.",
      disable_tcp_autotuning, check_tcp_autotuning_status, "Caution", "Low"),
-    ("set_qos_cs2", "Prioritize CS2 Traffic (QoS)",
-     "Create a QoS policy tagging CS2 packets with DSCP 46.",
+    ("set_qos_cs2", "Prioritize CS2 Traffic (QoS, All Protocols)",
+     "QoS policy tagging all cs2.exe traffic with DSCP 46 — broad policy covering TCP and UDP.",
      set_qos_cs2, check_qos_cs2_status, "Safe", "Medium"),
     ("optimize_network_adapter", "Optimize Network Adapter",
      "Disable power saving and interrupt moderation on the active adapter.",
      optimize_network_adapter, check_network_adapter_status, "Safe", "Medium"),
+]
+
+# CS2 UDP-specific optimizations
+UDP_OPTIMIZATIONS = [
+    ("optimize_udp_buffer", "Increase UDP Socket Buffers",
+     "Sets Windows AFD receive/send window to 1 MB — directly improves CS2 UDP socket performance and reduces packet loss.",
+     optimize_udp_buffer, check_udp_buffer_status, "Safe", "Medium"),
+    ("generate_cs2_autoexec", "Generate CS2 autoexec.cfg",
+     "Creates or updates autoexec.cfg with sections: Network (rate, interp, cmdrate, routing), Performance (fps, tracers, gamma), Mouse (raw input, accel, zoom sens), HUD (scaling, radar), Competitive (autohelp, gameinstructor), Audio (mixahead, pan).",
+     generate_cs2_autoexec, check_cs2_autoexec_status, "Safe", "High"),
+    ("optimize_qos_udp_cs2", "UDP QoS — CS2 Port 27005 (DSCP 46)",
+     "Creates a Windows QoS policy targeting only UDP traffic from cs2.exe on port 27005 with DSCP EF (46) — more precise than the broad QoS policy.",
+     optimize_qos_udp_cs2, check_qos_udp_cs2_status, "Safe", "Medium"),
 ]
